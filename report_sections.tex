@@ -1,0 +1,290 @@
+% ============================================================
+% FULL METHOD SECTION — Gina (pipeline) + Chiebuka (improvements)
+% ============================================================
+
+
+% ────────────────────────────────────────────────────────────
+\section{Method}
+% ────────────────────────────────────────────────────────────
+
+\subsection{System Pipeline}
+
+The system is structured as a sequential four-stage pipeline,
+taking raw Yelp data as input and producing a ranked list of
+businesses as output.
+
+\paragraph{Stage 1 — Data Loading.}
+The Yelp Academic Dataset is stored in JSON Lines format, with
+one business record per line.
+We load up to 5,000 records and retain four fields:
+business name, star rating (1–5), review count, and categories
+(a comma-separated string of tags such as ``restaurants, chinese, szechuan'').
+All other fields (address, hours, attributes, etc.) are discarded
+to keep the working set compact.
+
+\paragraph{Stage 2 — Preprocessing.}
+Raw records often contain missing or malformed values.
+We apply three cleaning steps:
+(1) drop any record missing one or more of the four retained fields;
+(2) coerce star ratings and review counts to numeric types,
+    dropping rows that cannot be converted;
+(3) lowercase and strip whitespace from the categories string so
+    that keyword comparisons are case-insensitive.
+After preprocessing, the working dataset contains 3,943 businesses.
+
+\paragraph{Stage 3 — Filtering.}
+Before ranking, a hard filter removes businesses below a
+user-specified minimum star rating (default: 3.0).
+This acts as a baseline quality gate, ensuring that no result
+with an unacceptably low rating is ever returned regardless of
+its keyword relevance or review count.
+Filtering is intentionally kept simple so that the ranking
+function, not the filter, is responsible for ordering results.
+
+\paragraph{Stage 4 — Ranking and Output.}
+The filtered set is passed to a ranking function (described in
+Sections~\ref{sec:baseline} and~\ref{sec:improved}) which assigns
+a scalar score to each business and returns the top-$K$.
+Results are written to a CSV file for reproducibility and
+rendered as a horizontal bar chart for visual inspection.
+The full pipeline is invoked through a single entry point:
+\texttt{python -m src.query}.
+
+\subsection{Baseline Ranking Model}
+\label{sec:baseline}
+
+The baseline system ranks businesses using a weighted linear combination
+of three normalized signals:
+
+\begin{equation}
+  s_{\text{base}}(b) \;=\;
+    w_r \cdot \frac{\text{stars}(b)}{5}
+    \;+\; w_v \cdot \min\!\left(\frac{\text{reviews}(b)}{1000},\;1\right)
+    \;+\; w_k \cdot \text{KM}(b,\,Q)
+  \label{eq:baseline}
+\end{equation}
+
+\noindent where the default weights are $w_r = 0.5$, $w_v = 0.3$,
+$w_k = 0.2$, and the keyword match score is
+
+\begin{equation}
+  \text{KM}(b, Q) \;=\;
+    \frac{1}{|Q|}\sum_{q \in Q} \mathbf{1}\!\left[q \in \text{cat}(b)\right]
+  \label{eq:km_baseline}
+\end{equation}
+
+\noindent with $\text{cat}(b)$ denoting the lowercased category string of
+business $b$ and $Q$ the set of user-provided query keywords.
+All scores are bounded in $[0, 1]$ and weights sum to 1.
+
+\subsection{Improved Ranking Model}
+\label{sec:improved}
+
+We identify three weaknesses in the baseline and address each:
+
+\paragraph{1. Review count normalization.}
+The baseline clips review count at 1,000, treating a business with
+1,001 reviews identically to one with 100,000.
+Popularity on Yelp follows a heavy-tailed distribution, so a
+logarithmic normalization is more appropriate:
+
+\begin{equation}
+  \phi(b) \;=\;
+    \frac{\ln\!\left(1 + \text{reviews}(b)\right)}
+         {\ln\!\left(1 + \max_{b' \in \mathcal{B}}\,\text{reviews}(b')\right)}
+  \label{eq:log_norm}
+\end{equation}
+
+\noindent This keeps scores in $[0,1]$, compresses the long tail, and
+preserves relative ordering across the full review-count range.
+
+\paragraph{2. Keyword matching scope.}
+The baseline matches query keywords only against the \texttt{categories}
+field.  Many businesses encode relevant terms in their name (e.g.\
+\textit{Han Dynasty}) rather than only in categories.  We extend
+matching to include the business name with a discounted credit:
+
+\begin{equation}
+  \text{KM}'(b, Q) \;=\;
+    \frac{1}{|Q|}\sum_{q \in Q}
+    \begin{cases}
+      1.0 & \text{if } q \in \text{cat}(b) \\
+      0.5 & \text{if } q \in \text{name}(b) \text{ and } q \notin \text{cat}(b) \\
+      0   & \text{otherwise}
+    \end{cases}
+  \label{eq:km_improved}
+\end{equation}
+
+\paragraph{3. Keyword weight.}
+Because query relevance should be a primary ranking signal, we raise
+$w_k$ from 0.2 to 0.3 and redistribute the remaining weight
+proportionally to preserve the original rating-to-review ratio:
+
+\begin{equation}
+  w_r = 0.4,\quad w_v = 0.3,\quad w_k = 0.3,\quad w_r + w_v + w_k = 1
+  \label{eq:weights}
+\end{equation}
+
+\paragraph{Improved scoring function.}
+Substituting the above into \eqref{eq:baseline}:
+
+\begin{equation}
+  s_{\text{imp}}(b) \;=\;
+    0.4\cdot\frac{\text{stars}(b)}{5}
+    \;+\; 0.3\cdot\phi(b)
+    \;+\; 0.3\cdot\text{KM}'(b,\,Q)
+  \label{eq:improved}
+\end{equation}
+
+\paragraph{Tie-breaking.}
+When two businesses share the same score, we break ties by
+$\text{reviews}(b)$ descending, giving preference to the more
+widely reviewed option as a secondary popularity signal.
+
+\paragraph{Top-$K$ selection.}
+Given dataset $\mathcal{B}$ and query $Q$, the output is
+
+\begin{equation}
+  \mathcal{R}^* \;=\;
+    \underset{\mathcal{R} \subseteq \mathcal{B},\,|\mathcal{R}|=K}{\arg\max}
+    \sum_{b \in \mathcal{R}} s_{\text{imp}}(b)
+\end{equation}
+
+\noindent which is solved by sorting all businesses by score and
+returning the top $K$ — an $O(n \log n)$ operation for dataset size $n$.
+
+
+% ────────────────────────────────────────────────────────────
+\section{Experimental Results}
+% ────────────────────────────────────────────────────────────
+
+\subsection{Experimental Setup}
+
+All experiments use the Yelp Academic Dataset (business subset),
+loaded as JSON-lines and preprocessed to retain businesses with
+non-null name, category, star rating, and review count.
+After filtering to a minimum rating of 3.0 stars, the working set
+contains 3,943 businesses.
+We fix $K = 5$ unless stated otherwise, and evaluate three queries:
+\textit{chinese + spicy}, \textit{pizza + italian},
+and \textit{coffee + brunch}.
+
+\subsection{Evaluation Metric: Precision@$K$}
+
+We define relevance as binary: business $b$ is relevant to query $Q$ if
+
+\begin{equation}
+  \text{rel}(b, Q) \;=\; \mathbf{1}\!\left[\exists\, q \in Q : q \in \text{cat}(b)\right]
+\end{equation}
+
+\noindent Precision at rank $K$ is then
+
+\begin{equation}
+  P@K \;=\; \frac{1}{K}\sum_{i=1}^{K} \text{rel}(b_i,\, Q)
+  \label{eq:precision}
+\end{equation}
+
+\noindent where $b_1, \ldots, b_K$ are the ranked results.
+This metric directly measures whether the returned businesses
+match the user's stated query intent.
+
+\subsection{Experiment 1: Multi-Query Comparison}
+
+Table~\ref{tab:multiquery} shows $P@5$ for the baseline and improved
+ranker across all three queries (Figure~\ref{fig:exp1}).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcc}
+\hline
+\textbf{Query} & \textbf{Baseline $P@5$} & \textbf{Improved $P@5$} \\
+\hline
+chinese + spicy  & 0.20 & \textbf{1.00} \\
+pizza + italian  & 0.40 & \textbf{1.00} \\
+coffee + brunch  & 1.00 & \textbf{1.00} \\
+\hline
+\end{tabular}
+\caption{Precision@5 comparison across three queries.}
+\label{tab:multiquery}
+\end{table}
+
+The baseline fails most severely on \textit{chinese + spicy}: its top-3
+results are non-Chinese restaurants (\textit{Prep \& Pastry},
+\textit{District Donuts}, \textit{Katie's Restaurant \& Bar}) that
+achieve high scores purely through star ratings and review counts.
+The improved model ranks \textit{Han Dynasty} first on this query,
+demonstrating that upweighting keyword relevance corrects for
+popularity bias.
+The \textit{coffee + brunch} query achieves $P@5 = 1.0$ under both
+methods because coffee and brunch are common categories, providing
+sufficient keyword signal even at low weight.
+
+\subsection{Experiment 2: Precision@$K$ Across Ranks}
+
+Table~\ref{tab:precatk} reports $P@K$ for $K \in \{1, 3, 5, 10\}$
+(Figure~\ref{fig:exp2}).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llcccc}
+\hline
+\textbf{Query} & \textbf{Method} & $P@1$ & $P@3$ & $P@5$ & $P@10$ \\
+\hline
+chinese + spicy & Baseline & 0.00 & 0.00 & 0.20 & 0.10 \\
+                & Improved & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} \\
+\hline
+pizza + italian & Baseline & 1.00 & 0.67 & 0.40 & 0.40 \\
+                & Improved & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} \\
+\hline
+coffee + brunch & Baseline & 1.00 & 1.00 & 1.00 & 0.90 \\
+                & Improved & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} & \textbf{1.00} \\
+\hline
+\end{tabular}
+\caption{Precision@$K$ for both rankers across queries and rank cutoffs.}
+\label{tab:precatk}
+\end{table}
+
+The improved ranker achieves perfect precision at every cutoff and
+every query.
+Baseline precision degrades as $K$ grows because high-review-count
+irrelevant businesses accumulate in lower ranks.
+This confirms that the popularity bias in the baseline is a
+structural limitation, not a marginal effect.
+
+\subsection{Experiment 3: Keyword Weight Sensitivity}
+
+To justify the choice $w_k = 0.3$, we sweep $w_k$ from 0 to 0.6,
+redistributing the remaining weight between $w_r$ and $w_v$ in a
+fixed 5:3 ratio (Figure~\ref{fig:exp3}).
+
+Key observations:
+\begin{itemize}
+  \item At $w_k = 0$ (pure popularity), $P@5 = 0.00$ for
+        \textit{chinese + spicy} — the model returns no relevant results.
+  \item Precision rises to 0.40 at $w_k = 0.20$ (baseline weight)
+        and reaches 1.00 at $w_k \geq 0.25$.
+  \item The mean score of irrelevant results in the top-$K$ drops to
+        zero at $w_k = 0.25$, meaning no irrelevant business can
+        outrank a keyword-matching one past this threshold.
+  \item $w_k = 0.30$ sits comfortably past the transition point,
+        providing a margin against edge cases while keeping
+        rating and review signals influential.
+\end{itemize}
+
+\subsection{Discussion \& Future Work}
+
+The results demonstrate that a modest increase in keyword weight
+eliminates the popularity bias that plagues the baseline while
+preserving the value of quality and engagement signals.
+The log normalization of review counts prevents a business with
+10,000 reviews from dominating one with 1,000 reviews, allowing
+truly relevant but moderately popular businesses to surface.
+
+One limitation is that our relevance metric (keyword in category)
+is imperfect: \textit{Dawna Ara, DACM, LAc} (an acupuncture clinic)
+ranks second on \textit{chinese + spicy} because ``traditional chinese
+medicine'' appears in its categories.
+Future work could address this by (1) restricting matches to a
+business-type filter (e.g.\ restaurants only), (2) incorporating
+semantic similarity via word embeddings, or (3) learning weights
+from user click data rather than setting them manually.
