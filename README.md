@@ -82,7 +82,8 @@ Where:
 ## How to Run
 From project Root:
 ```
-python -m src.query
+python3 -m pip install pandas matplotlib
+python3 -m src.query
 ```
 Example output:
 ```
